@@ -1,0 +1,22 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "identifier": "default",
+  "description": "Default MixMind capabilities",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:allow-open",
+    "dialog:allow-save",
+    "fs:allow-read-text-file",
+    "fs:allow-write-text-file",
+    "fs:allow-read-file",
+    "fs:allow-app-read-recursive",
+    "fs:allow-home-read-recursive",
+    "fs:allow-read-dir",
+    "fs:allow-exists",
+    "fs:allow-watch",
+    "fs:allow-app-write-recursive",
+    "shell:allow-open",
+    "http:default"
+  ]
+}

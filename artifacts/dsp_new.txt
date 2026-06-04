@@ -1,0 +1,405 @@
+// ─── prepareToPlay ───────────────────────────────────────────────────────────
+void MixMindMultiFXProcessor::prepareToPlay(double sampleRate, int blockSize)
+{
+    m_sampleRate = currentSampleRate = sampleRate;
+    m_blockSize  = blockSize;
+
+    juce::dsp::ProcessSpec stereoSpec { sampleRate, (juce::uint32)blockSize, 2 };
+    juce::dsp::ProcessSpec monoSpec   { sampleRate, (juce::uint32)blockSize, 1 };
+
+    for (int i=0; i<8; ++i) {
+        m_eqs[i] = std::make_unique<EQBlock>();
+        for (int b=0; b<7; ++b) { m_eqs[i]->filters[b][0].prepare(monoSpec); m_eqs[i]->filters[b][1].prepare(monoSpec); }
+        for (int c=0; c<4; ++c) { m_eqs[i]->hp[c][0].prepare(monoSpec); m_eqs[i]->hp[c][1].prepare(monoSpec); }
+        for (int c=0; c<4; ++c) { m_eqs[i]->lp[c][0].prepare(monoSpec); m_eqs[i]->lp[c][1].prepare(monoSpec); }
+        
+        m_comps[i].prepare(stereoSpec);
+        
+        m_exciters[i] = std::make_unique<ExciterBlock>();
+        m_exciters[i]->hpL.prepare(monoSpec); m_exciters[i]->hpR.prepare(monoSpec);
+
+        m_limiters[i].prepare(stereoSpec);
+        
+        m_reverbs[i].setSampleRate(sampleRate);
+        m_choruses[i].prepare(stereoSpec);
+        m_flangers[i].prepare(stereoSpec);
+
+        m_delays[i] = std::make_unique<DelayBlock>();
+        m_delays[i]->buffer.setSize(2, (int)(sampleRate * 2.0));
+        m_delays[i]->buffer.clear();
+    }
+
+    m_lufsState = LufsState{};
+    m_fftBuffer.assign(kFftSize * 2, 0.0f);
+    m_fftBands.fill(-100.0f);
+    m_fftAccum = 0;
+    m_corrSumLR = 0.f; m_corrSumLL = 0.f; m_corrSumRR = 0.f;
+    m_corrCount = 0;
+
+    m_shm.open();
+    isConnected.store(m_shm.isOpen());
+}
+
+void MixMindMultiFXProcessor::releaseResources()
+{
+    m_shm.markInactive(instanceId.toRawUTF8());
+    isConnected.store(false);
+}
+
+// ─── EQ ──────────────────────────────────────────────────────────────────────
+void MixMindMultiFXProcessor::updateEQ(int slot, const SlotState& s)
+{
+    double sr = m_sampleRate > 0 ? m_sampleRate : 48000.0;
+    auto* eq = m_eqs[slot].get();
+    
+    auto getFreq = [](float p) { return 20.f * std::pow(1000.f, p); }; // 20Hz-20kHz
+    auto getGain = [](float p) { return (p * 36.f) - 18.f; }; // -18..+18
+    auto getQ    = [](float p) { return 0.1f + p * 9.9f; }; // 0.1..10
+
+    // HP
+    int hpSlope = (int)(s.p[2] * 3.f);
+    if (hpSlope == 0) {
+        auto hpC = juce::dsp::IIR::Coefficients<float>::makeFirstOrderHighPass(sr, getFreq(s.p[1]));
+        *eq->hp[0][0].coefficients = *hpC; *eq->hp[0][1].coefficients = *hpC;
+    } else {
+        auto hpC = juce::dsp::IIR::Coefficients<float>::makeHighPass(sr, getFreq(s.p[1]), 0.707f);
+        int cascades = (hpSlope == 1) ? 1 : (hpSlope == 2) ? 2 : 4;
+        for (int c = 0; c < cascades; ++c) { *eq->hp[c][0].coefficients = *hpC; *eq->hp[c][1].coefficients = *hpC; }
+    }
+    
+    // LP
+    int lpSlope = (int)(s.p[18] * 3.f);
+    if (lpSlope == 0) {
+        auto lpC = juce::dsp::IIR::Coefficients<float>::makeFirstOrderLowPass(sr, getFreq(s.p[17]));
+        *eq->lp[0][0].coefficients = *lpC; *eq->lp[0][1].coefficients = *lpC;
+    } else {
+        auto lpC = juce::dsp::IIR::Coefficients<float>::makeLowPass(sr, getFreq(s.p[17]), 0.707f);
+        int cascades = (lpSlope == 1) ? 1 : (lpSlope == 2) ? 2 : 4;
+        for (int c = 0; c < cascades; ++c) { *eq->lp[c][0].coefficients = *lpC; *eq->lp[c][1].coefficients = *lpC; }
+    }
+
+    // Bells & Shelves
+    auto lsC = juce::dsp::IIR::Coefficients<float>::makeLowShelf(sr, getFreq(s.p[3]), 0.707f, juce::Decibels::decibelsToGain(getGain(s.p[4])));
+    *eq->filters[1][0].coefficients = *lsC; *eq->filters[1][1].coefficients = *lsC;
+    auto lmC = juce::dsp::IIR::Coefficients<float>::makePeakFilter(sr, getFreq(s.p[5]), getQ(s.p[7]), juce::Decibels::decibelsToGain(getGain(s.p[6])));
+    *eq->filters[2][0].coefficients = *lmC; *eq->filters[2][1].coefficients = *lmC;
+    auto mC  = juce::dsp::IIR::Coefficients<float>::makePeakFilter(sr, getFreq(s.p[8]), getQ(s.p[10]), juce::Decibels::decibelsToGain(getGain(s.p[9])));
+    *eq->filters[3][0].coefficients = *mC;  *eq->filters[3][1].coefficients = *mC;
+    auto hmC = juce::dsp::IIR::Coefficients<float>::makePeakFilter(sr, getFreq(s.p[11]), getQ(s.p[13]), juce::Decibels::decibelsToGain(getGain(s.p[12])));
+    *eq->filters[4][0].coefficients = *hmC; *eq->filters[4][1].coefficients = *hmC;
+    auto hsC = juce::dsp::IIR::Coefficients<float>::makeHighShelf(sr, getFreq(s.p[14]), 0.707f, juce::Decibels::decibelsToGain(getGain(s.p[15])));
+    *eq->filters[5][0].coefficients = *hsC; *eq->filters[5][1].coefficients = *hsC;
+}
+
+void MixMindMultiFXProcessor::processEQ(int slot, juce::AudioBuffer<float>& buf, const SlotState& s)
+{
+    updateEQ(slot, s);
+    const int N = buf.getNumSamples();
+    float* L = buf.getWritePointer(0);
+    float* R = buf.getWritePointer(1);
+    bool hpOn = s.p[0] > 0.5f;
+    bool lpOn = s.p[16] > 0.5f;
+    int hpSlope = (int)(s.p[2] * 3.f);
+    int hpCascades = (hpSlope == 0 || hpSlope == 1) ? 1 : (hpSlope == 2) ? 2 : 4;
+    int lpSlope = (int)(s.p[18] * 3.f);
+    int lpCascades = (lpSlope == 0 || lpSlope == 1) ? 1 : (lpSlope == 2) ? 2 : 4;
+
+    auto* eq = m_eqs[slot].get();
+    for (int i = 0; i < N; ++i) {
+        if (hpOn) { 
+            for (int c = 0; c < hpCascades; ++c) { L[i] = eq->hp[c][0].processSample(L[i]); R[i] = eq->hp[c][1].processSample(R[i]); }
+        }
+        for (int f = 1; f <= 5; ++f) {
+            L[i] = eq->filters[f][0].processSample(L[i]); R[i] = eq->filters[f][1].processSample(R[i]);
+        }
+        if (lpOn) { 
+            for (int c = 0; c < lpCascades; ++c) { L[i] = eq->lp[c][0].processSample(L[i]); R[i] = eq->lp[c][1].processSample(R[i]); }
+        }
+    }
+}
+
+// ─── Compressor ──────────────────────────────────────────────────────────────
+void MixMindMultiFXProcessor::processCompressor(int slot, juce::AudioBuffer<float>& buf, const SlotState& s)
+{
+    float thresh  = (s.p[0] * 60.f) - 60.f; // -60..0
+    float ratio   = 1.f + (s.p[1] * 19.f);  // 1..20
+    float attack  = 0.1f + (s.p[2] * 199.9f); // 0.1..200
+    float release = 10.f + (s.p[3] * 1990.f); // 10..2000
+    float makeup  = s.p[5] * 24.f; // 0..24
+    float mix     = s.p[6]; // 0..1
+    int   type    = (int)(s.p[7] * 3.f); // 0..3
+
+    switch (type) {
+        case 1: attack = std::min(attack, 10.0f); ratio = std::max(ratio, 4.0f); break;
+        case 2: attack = std::max(attack, 5.0f); release = std::max(release, 100.0f); break;
+        case 3: ratio = std::min(ratio, 6.0f); attack = std::max(attack, 1.0f); break;
+        default: break;
+    }
+
+    auto& comp = m_comps[slot];
+    comp.setThreshold(thresh); comp.setRatio(ratio); comp.setAttack(attack); comp.setRelease(release);
+
+    juce::AudioBuffer<float> dry; dry.makeCopyOf(buf);
+    juce::dsp::AudioBlock<float> block(buf);
+    juce::dsp::ProcessContextReplacing<float> ctx(block);
+    comp.process(ctx);
+
+    float mkGain = juce::Decibels::decibelsToGain(makeup);
+    buf.applyGain(mkGain);
+
+    if (type == 1) { // FET sat
+        const float d = 1.2f;
+        for (int ch = 0; ch < buf.getNumChannels(); ++ch) {
+            float* p = buf.getWritePointer(ch);
+            for (int i = 0; i < buf.getNumSamples(); ++i) p[i] = std::tanh(p[i] * d) / std::tanh(d);
+        }
+    }
+
+    if (mix < 0.999f) {
+        for (int ch = 0; ch < buf.getNumChannels(); ++ch) {
+            auto* wet = buf.getWritePointer(ch); const auto* d = dry.getReadPointer(ch);
+            for (int i = 0; i < buf.getNumSamples(); ++i) wet[i] = mix * wet[i] + (1.f - mix) * d[i];
+        }
+    }
+}
+
+// ─── Exciter ──────────────────────────────────────────────────────────────
+void MixMindMultiFXProcessor::processExciter(int slot, juce::AudioBuffer<float>& buf, const SlotState& s)
+{
+    float drive = s.p[0] * 10.f; // 0..10
+    if (drive < 0.01f) return;
+    float freq = 200.f * std::pow(100.f, s.p[1]); // 200..20k
+    float mix = s.p[2]; // 0..1
+    int type = (int)(s.p[3] * 4.f);
+
+    auto hpC = juce::dsp::IIR::Coefficients<float>::makeHighPass(m_sampleRate, (double)freq, 0.707);
+    auto* exc = m_exciters[slot].get();
+    *exc->hpL.coefficients = *hpC; *exc->hpR.coefficients = *hpC;
+
+    float driveGain = juce::Decibels::decibelsToGain(drive * 2.0f);
+    const int N = buf.getNumSamples();
+    float* L = buf.getWritePointer(0); float* R = buf.getWritePointer(1);
+
+    for (int i = 0; i < N; ++i) {
+        float hpL = exc->hpL.processSample(L[i]) * driveGain;
+        float hpR = exc->hpR.processSample(R[i]) * driveGain;
+        float satL = saturate(hpL, drive * 0.5f, type);
+        float satR = saturate(hpR, drive * 0.5f, type);
+        L[i] += mix * satL * 0.3f; R[i] += mix * satR * 0.3f;
+    }
+}
+
+// ─── Limiter ─────────────────────────────────────────────────────────────────
+void MixMindMultiFXProcessor::processLimiter(int slot, juce::AudioBuffer<float>& buf, const SlotState& s)
+{
+    float thresh  = (s.p[0] * 20.f) - 20.f;
+    float ceil    = (s.p[1] * 6.f) - 6.f;
+    float release = 1.f + (s.p[2] * 499.f);
+    int mode = (int)(s.p[3] * 1.f);
+    
+    if (mode == 0) {
+        m_limiters[slot].setThreshold(thresh); m_limiters[slot].setRelease(release);
+        juce::dsp::AudioBlock<float> block(buf);
+        juce::dsp::ProcessContextReplacing<float> ctx(block);
+        m_limiters[slot].process(ctx);
+    } else {
+        float tg = juce::Decibels::decibelsToGain(thresh);
+        float cg = juce::Decibels::decibelsToGain(ceil);
+        for (int ch = 0; ch < buf.getNumChannels(); ++ch) {
+            float* p = buf.getWritePointer(ch);
+            for (int i = 0; i < buf.getNumSamples(); ++i) {
+                float v = p[i];
+                if (std::abs(v) > tg * 0.8f) {
+                    float ex = std::abs(v) - tg * 0.8f;
+                    v = (v > 0.f ? 1.f : -1.f) * (tg * 0.8f + std::tanh(ex * 3.f) / 3.f);
+                }
+                p[i] = std::clamp(v, -cg, cg);
+            }
+        }
+    }
+}
+
+// ─── Reverb ─────────────────────────────────────────────────────────────────
+void MixMindMultiFXProcessor::processReverb(int slot, juce::AudioBuffer<float>& buf, const SlotState& s)
+{
+    juce::Reverb::Parameters rp;
+    rp.roomSize = s.p[0]; // 0..1
+    rp.damping  = s.p[1]; // 0..1
+    rp.wetLevel = s.p[2]; // 0..1
+    rp.dryLevel = s.p[3]; // 0..1
+    rp.width    = s.p[4]; // 0..1
+    rp.freezeMode = s.p[5]; // 0..1
+    
+    m_reverbs[slot].setParameters(rp);
+    
+    if (buf.getNumChannels() == 1) m_reverbs[slot].processMono(buf.getWritePointer(0), buf.getNumSamples());
+    else m_reverbs[slot].processStereo(buf.getWritePointer(0), buf.getWritePointer(1), buf.getNumSamples());
+}
+
+// ─── Delay ─────────────────────────────────────────────────────────────────
+void MixMindMultiFXProcessor::processDelay(int slot, juce::AudioBuffer<float>& buf, const SlotState& s)
+{
+    auto* del = m_delays[slot].get();
+    float timeL = 0.01f + s.p[0] * 1.99f; // 10ms..2000ms
+    float timeR = 0.01f + s.p[1] * 1.99f;
+    float fb    = s.p[2] * 0.95f; // limit feedback
+    float mix   = s.p[3];
+    
+    int sampsL = (int)(timeL * m_sampleRate);
+    int sampsR = (int)(timeR * m_sampleRate);
+    int maxSamps = del->buffer.getNumSamples();
+    
+    float* dL = del->buffer.getWritePointer(0);
+    float* dR = del->buffer.getWritePointer(1);
+    
+    float* iL = buf.getWritePointer(0);
+    float* iR = buf.getNumChannels() > 1 ? buf.getWritePointer(1) : nullptr;
+    
+    for (int i = 0; i < buf.getNumSamples(); ++i) {
+        int readPosL = del->writePos - sampsL; if (readPosL < 0) readPosL += maxSamps;
+        int readPosR = del->writePos - sampsR; if (readPosR < 0) readPosR += maxSamps;
+        
+        float outL = dL[readPosL];
+        float outR = dR[readPosR];
+        
+        float inSampleL = iL[i];
+        float inSampleR = iR ? iR[i] : iL[i];
+        
+        dL[del->writePos] = inSampleL + outL * fb;
+        dR[del->writePos] = inSampleR + outR * fb;
+        
+        iL[i] = iL[i] * (1.f - mix) + outL * mix;
+        if (iR) iR[i] = iR[i] * (1.f - mix) + outR * mix;
+        
+        if (++del->writePos >= maxSamps) del->writePos = 0;
+    }
+}
+
+// ─── Chorus & Flanger ─────────────────────────────────────────────────────
+void MixMindMultiFXProcessor::processChorus(int slot, juce::AudioBuffer<float>& buf, const SlotState& s)
+{
+    m_choruses[slot].setRate(0.1f + s.p[0] * 9.9f); // 0.1..10 Hz
+    m_choruses[slot].setDepth(s.p[1]); // 0..1
+    m_choruses[slot].setCentreDelay(1.f + s.p[2] * 99.f); // 1..100 ms
+    m_choruses[slot].setFeedback(s.p[3] * 0.95f);
+    m_choruses[slot].setMix(s.p[4]);
+    
+    juce::dsp::AudioBlock<float> block(buf);
+    juce::dsp::ProcessContextReplacing<float> ctx(block);
+    m_choruses[slot].process(ctx);
+}
+
+void MixMindMultiFXProcessor::processFlanger(int slot, juce::AudioBuffer<float>& buf, const SlotState& s)
+{
+    m_flangers[slot].setRate(0.01f + s.p[0] * 4.99f); // 0.01..5 Hz
+    m_flangers[slot].setDepth(s.p[1]); // 0..1
+    m_flangers[slot].setCentreFrequency(200.f + s.p[2] * 8000.f); // 200..8200 Hz
+    m_flangers[slot].setFeedback(s.p[3] * 0.95f);
+    m_flangers[slot].setMix(s.p[4]);
+    
+    juce::dsp::AudioBlock<float> block(buf);
+    juce::dsp::ProcessContextReplacing<float> ctx(block);
+    m_flangers[slot].process(ctx);
+}
+
+// ─── Effect dispatch ─────────────────────────────────────────────────────────
+void MixMindMultiFXProcessor::processSlot(int slotIdx, juce::AudioBuffer<float>& serialBus, juce::AudioBuffer<float>& parallelBus)
+{
+    auto getG = [this](const juce::String& id) { return apvts.getRawParameterValue(id)->load(); };
+    juce::String pfx = "slot" + juce::String(slotIdx + 1);
+    
+    SlotState s;
+    s.type = (int)getG(pfx + "_type");
+    s.parallel = getG(pfx + "_parallel") > 0.5f;
+    s.bypass = getG(pfx + "_bypass") > 0.5f;
+    for (int p=0; p<20; ++p) s.p[p] = getG(pfx + "_p" + juce::String(p+1));
+
+    if (s.type == 0 || s.bypass) return; // Empty or Bypassed
+
+    // If parallel, we copy the serial bus, process the copy, and add it to the parallel bus.
+    // If serial, we process the serial bus directly.
+    juce::AudioBuffer<float> tempBuf;
+    if (s.parallel) {
+        tempBuf.makeCopyOf(serialBus);
+    }
+    
+    juce::AudioBuffer<float>& targetBuf = s.parallel ? tempBuf : serialBus;
+
+    switch (s.type) {
+        case 1: processEQ(slotIdx, targetBuf, s); break;
+        case 2: processCompressor(slotIdx, targetBuf, s); break;
+        case 3: processExciter(slotIdx, targetBuf, s); break;
+        case 4: processLimiter(slotIdx, targetBuf, s); break;
+        case 5: processReverb(slotIdx, targetBuf, s); break;
+        case 6: processDelay(slotIdx, targetBuf, s); break;
+        case 7: processChorus(slotIdx, targetBuf, s); break;
+        case 8: processFlanger(slotIdx, targetBuf, s); break;
+        default: break;
+    }
+    
+    if (s.parallel) {
+        for (int ch=0; ch<targetBuf.getNumChannels(); ++ch)
+            parallelBus.addFrom(ch, 0, targetBuf, ch, 0, targetBuf.getNumSamples());
+    }
+}
+
+// ─── processBlock ─────────────────────────────────────────────────────────────
+void MixMindMultiFXProcessor::processBlock(juce::AudioBuffer<float>& buf, juce::MidiBuffer&)
+{
+    juce::ScopedNoDenormals noDenormals;
+    auto inCh  = getTotalNumInputChannels();
+    auto outCh = getTotalNumOutputChannels();
+    for (int ch = inCh; ch < outCh; ++ch) buf.clear(ch, 0, buf.getNumSamples());
+    if (inCh < 2 || buf.getNumSamples() == 0) return;
+
+    // In gain
+    float inGdB = apvts.getRawParameterValue("in_gain")->load();
+    buf.applyGain(juce::Decibels::decibelsToGain(inGdB));
+
+    // Parallel Bus
+    juce::AudioBuffer<float> parallelBus(buf.getNumChannels(), buf.getNumSamples());
+    parallelBus.clear();
+
+    // 8-Slot Rack Processing
+    for (int i = 0; i < 8; ++i) {
+        processSlot(i, buf, parallelBus);
+    }
+
+    // Sum Parallel Bus back to Serial Bus
+    for (int ch = 0; ch < buf.getNumChannels(); ++ch) {
+        buf.addFrom(ch, 0, parallelBus, ch, 0, buf.getNumSamples());
+    }
+
+    // Out gain
+    float outGdB = apvts.getRawParameterValue("out_gain")->load();
+    buf.applyGain(juce::Decibels::decibelsToGain(outGdB));
+
+    // Analysis
+    int N = buf.getNumSamples();
+    const float* L = buf.getReadPointer(0);
+    const float* R = buf.getReadPointer(1);
+    processLufs(L, R, N);
+    processFFT(L, R, N);
+    processStereo(L, R, N);
+
+    // RMS & Crest Factor
+    float rmsL = 0, rmsR = 0, peakL = 0, peakR = 0;
+    for (int i = 0; i < N; ++i) { 
+        float absL = std::abs(L[i]); float absR = std::abs(R[i]);
+        rmsL += absL*absL; rmsR += absR*absR; 
+        if (absL > peakL) peakL = absL;
+        if (absR > peakR) peakR = absR;
+    }
+    float inv = N > 0 ? 1.f/N : 0.f;
+    float rmsDbL = 20.f * std::log10(std::max(std::sqrt(rmsL*inv), kSil));
+    float rmsDbR = 20.f * std::log10(std::max(std::sqrt(rmsR*inv), kSil));
+    currentRmsL.store(rmsDbL);
+    currentRmsR.store(rmsDbR);
+    
+    float peakDb = 20.f * std::log10(std::max(std::max(peakL, peakR), kSil));
+    float rmsDbMax = std::max(rmsDbL, rmsDbR);
+    m_crestFactor = std::max(0.0f, peakDb - rmsDbMax);
+
+    processPreviewCapture(buf);
+    writeToSharedMemory(buf);
+}

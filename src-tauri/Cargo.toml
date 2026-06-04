@@ -1,0 +1,78 @@
+[package]
+name = "mixmind"
+version = "0.1.0"
+description = "MixMind — AI Mixing Assistant"
+authors = ["MixMind"]
+edition = "2021"
+default-run = "mixmind"
+
+[package.metadata.bundle]
+name = "MixMind"
+identifier = "com.mixmind.app"
+icon = ["icons/32x32.png", "icons/128x128.png", "icons/icon.ico"]
+
+# Tauri build script
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-http = "2"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP client for Claude API (SSE streaming)
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"
+
+# Audio decoding
+symphonia = { version = "0.5", features = ["mp3", "wav", "aac", "isomp4"] }
+
+# FFT
+rustfft = "6.2"
+
+# Resampling
+rubato = "0.16"
+
+# Shared memory
+shared_memory = "0.12"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Config file (TOML)
+toml = "0.8"
+dirs = "5"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# UUID for VST instance IDs
+uuid = { version = "1", features = ["v4"] }
+
+# Time
+chrono = { version = "0.4", features = ["serde"] }
+rosc = "0.11.4"
+
+[[bin]]
+name = "mixmind"
+path = "src/main.rs"
+
+[[bin]]
+name = "mock-bridge"
+path = "src/bin/mock_bridge.rs"
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

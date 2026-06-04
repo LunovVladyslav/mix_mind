@@ -1,0 +1,45 @@
+# Node.js
+node_modules/
+dist/
+.next/
+out/
+
+# Rust / Cargo build artifacts
+src-tauri/target/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Package lock (keep one, exclude others if desired)
+# package-lock.json
+# yarn.lock
+
+# C++/JUCE Build artifacts
+build/
+*.lib
+*.dll
+*.vst3
+*.exe
+JuceLibraryCode/
+
+
+# Nested git repos / test binaries
+test_shm_bin/

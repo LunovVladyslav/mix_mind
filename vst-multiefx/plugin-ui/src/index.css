@@ -1,0 +1,21 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-[#0f172a] text-white m-0 p-0 overflow-hidden font-sans select-none;
+  }
+}
+
+@layer utilities {
+  .neon-glow {
+    box-shadow: 0 0 10px rgba(0, 229, 255, 0.5), inset 0 0 5px rgba(0, 229, 255, 0.2);
+  }
+  .neon-text-glow {
+    text-shadow: 0 0 5px rgba(0, 229, 255, 0.8);
+  }
+  .gradient-bg {
+    background: linear-gradient(180deg, #1e293b 0%, #0f172a 100%);
+  }
+}
