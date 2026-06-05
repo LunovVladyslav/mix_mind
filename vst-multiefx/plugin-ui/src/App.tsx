@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect, memo } from 'react';
+import { useState, useRef, useEffect, memo } from 'react';
 import { useJuceSlider, useJuceComboBox, useJuceToggle } from './hooks/useJuce';
 
 const getTypeLabel = (type: number) => {
@@ -11,17 +11,15 @@ const getTypeLabel = (type: number) => {
   }
 };
 
-const DUMMY_PRESETS = [
-  { category: "Mastering", names: ["Clean Push", "Aggressive Limit", "Warm Tape", "Acoustic Polish"] },
-  { category: "Drums", names: ["Punchy Kick", "Snare Crack", "Drum Bus Glue"] },
-  { category: "Vocals", names: ["Airy Pop Vocal", "Thick Rock Vocal", "De-Ess & Comp"] },
-];
+
 
 const ROUTING_MODES = ["STEREO", "DUAL MONO", "MID / SIDE"];
 
 const Slot = memo(({ index }: { index: number }) => {
-  const [type, setType] = useJuceComboBox(`slot${index}_type`, index <= 4 ? index : 0);
+  const [type] = useJuceComboBox(`slot${index}_type`, 0);
   const [bypass, setBypass] = useJuceToggle(`slot${index}_bypass`, false);
+
+  if (type === 0) return null;
 
   const isActive = type > 0 && !bypass;
 
@@ -58,16 +56,25 @@ const Knob = memo(({ paramId, label, defaultVal }: { paramId: string, label: str
     
     let isDragging = false;
     let startY = 0;
+    // We get the current value directly from the slider state to avoid dependency issues
     let startVal = 0;
 
     const onMouseDown = (e: MouseEvent) => {
       isDragging = true;
       startY = e.clientY;
-      startVal = val;
-      if(window.juce && window.juce.getSliderState) {
-        window.juce.getSliderState(paramId)?.sliderDragStarted();
+      if (window.juce && window.juce.getSliderState) {
+          const state = window.juce.getSliderState(paramId);
+          if (state) {
+              startVal = state.getNormalisedValue();
+              state.sliderDragStarted();
+          } else {
+              startVal = 0.5;
+          }
+      } else {
+          startVal = 0.5;
       }
     };
+    
     const onMouseMove = (e: MouseEvent) => {
       if (!isDragging) return;
       const dy = startY - e.clientY;
@@ -75,9 +82,10 @@ const Knob = memo(({ paramId, label, defaultVal }: { paramId: string, label: str
       newVal = Math.max(0, Math.min(1, newVal));
       setVal(newVal);
     };
+    
     const onMouseUp = () => {
-      if(isDragging) {
-        if(window.juce && window.juce.getSliderState) {
+      if (isDragging) {
+        if (window.juce && window.juce.getSliderState) {
           window.juce.getSliderState(paramId)?.sliderDragEnded();
         }
       }
@@ -93,7 +101,7 @@ const Knob = memo(({ paramId, label, defaultVal }: { paramId: string, label: str
       window.removeEventListener('mousemove', onMouseMove);
       window.removeEventListener('mouseup', onMouseUp);
     };
-  }, [val, setVal, paramId]);
+  }, [setVal, paramId]);
 
   return (
     <div className="w-28 flex flex-col items-center justify-center gap-4">
@@ -112,22 +120,65 @@ const Knob = memo(({ paramId, label, defaultVal }: { paramId: string, label: str
   );
 });
 
-// Memoized Fake Meter so it doesn't re-render constantly
+// Meter Component
 const Meter = memo(({ routingMode }: { routingMode: number }) => {
+  const [bands, setBands] = useState<number[]>(Array(40).fill(0));
+  
+  useEffect(() => {
+    let animationFrameId: number;
+    let isCancelled = false;
+
+    const fetchFft = async () => {
+      const getAnalyzerData = (window as any).__JUCE__?.backend?.getAnalyzerData || (window as any).getAnalyzerData;
+      if (getAnalyzerData) {
+        try {
+          const data = await getAnalyzerData();
+          if (!isCancelled && data && Array.isArray(data)) {
+            // Map 31 bands into the 40 display bars
+            const newBands = Array(40).fill(0);
+            for (let i = 0; i < 40; i++) {
+              if (i === 20) continue; // Gap
+              const fftIdx = Math.floor((i / 40) * 31);
+              if (fftIdx < data.length) {
+                // Convert DB to % height
+                const db = data[fftIdx];
+                // Suppose -100dB to 0dB range
+                let height = ((db + 80) / 80) * 100;
+                if (height < 0) height = 0;
+                if (height > 100) height = 100;
+                newBands[i] = height;
+              }
+            }
+            setBands(newBands);
+          }
+        } catch(e) {}
+      }
+      if (!isCancelled) {
+        animationFrameId = requestAnimationFrame(fetchFft);
+      }
+    };
+
+    fetchFft();
+
+    return () => {
+      isCancelled = true;
+      cancelAnimationFrame(animationFrameId);
+    };
+  }, []);
+
   return (
     <div className="flex-1 rounded-[50px] border border-[#00E5FF] shadow-[0_0_15px_rgba(0,229,255,0.3),inset_0_0_10px_rgba(0,229,255,0.1)] bg-[#07090d] relative overflow-hidden flex items-center justify-center p-6">
       <div className="absolute top-3 text-[9px] text-slate-500 font-bold tracking-[0.2em]">
         {routingMode === 2 ? 'MID / SIDE' : 'LEFT / RIGHT'}
       </div>
       <div className="flex items-end h-full gap-[3px] pt-4 w-full justify-center opacity-90">
-          {Array.from({length: 40}).map((_, i) => {
-            const height = 15 + Math.sin(i * 0.4) * 30 + Math.random() * 45;
-            // Visual gap for dual mono / MS
+          {bands.map((height, i) => {
             if (i === 20) return <div key={i} className="w-4" />;
             return (
               <div key={i} className="w-2 rounded-t-sm" style={{ 
-                height: `${height}%`,
-                background: height > 75 ? `linear-gradient(to top, #00E5FF, #FF0055)` : `linear-gradient(to top, #00E5FF, #0077FF)`
+                height: `${Math.max(2, height)}%`,
+                background: height > 75 ? `linear-gradient(to top, #00E5FF, #FF0055)` : `linear-gradient(to top, #00E5FF, #0077FF)`,
+                transition: 'height 0.1s ease-out'
               }}/>
             )
           })}
@@ -137,9 +188,6 @@ const Meter = memo(({ routingMode }: { routingMode: number }) => {
 });
 
 export default function App() {
-  const [isPresetBrowserOpen, setIsPresetBrowserOpen] = useState(false);
-  const [currentPreset, setCurrentPreset] = useState("CLEAN PUSH");
-  
   const [monoSwitch, setMonoSwitch] = useJuceToggle('mono_switch', false);
   const [globalBypass, setGlobalBypass] = useJuceToggle('global_bypass', false);
   const [routingMode, setRoutingMode] = useJuceComboBox('routing_mode', 0);
@@ -151,11 +199,15 @@ export default function App() {
 
   const [isScaleMenuOpen, setIsScaleMenuOpen] = useState(false);
 
+  // New Routing parameters
+  const [channelType, setChannelType] = useJuceComboBox('type', 0);
+  const [channelIdx, setChannelIdx] = useJuceSlider('channel', 0);
+  const CHANNEL_TYPES = ["Instrument", "Vocal", "Drums", "Bass", "Other"];
+
   return (
-    <div className="w-screen h-screen flex items-center justify-center bg-[#05080c] font-sans overflow-hidden">
+    <div className="w-screen h-screen bg-[#05080c] font-sans overflow-hidden flex items-center justify-center" style={{ zoom: scale }}>
       <div 
-        className="w-[850px] h-[400px] flex flex-col p-5 bg-[#0e1218] rounded-xl border border-slate-800 shadow-[0_0_50px_rgba(0,229,255,0.05)] relative overflow-hidden"
-        style={{ transform: `scale(${scale})`, transformOrigin: 'center center' }}
+        className="w-[850px] h-[400px] flex flex-col p-5 bg-[#0e1218] border border-slate-800 shadow-[0_0_50px_rgba(0,229,255,0.05)] relative overflow-hidden rounded-xl"
       >
         
         {/* Top Bar */}
@@ -163,13 +215,6 @@ export default function App() {
           <h1 className="text-xl font-bold tracking-[0.2em] text-white">MIXMIND</h1>
           
           <div className="flex items-center gap-6">
-            <div className="flex items-center gap-2 cursor-pointer group" onClick={() => setIsPresetBrowserOpen(!isPresetBrowserOpen)}>
-              <span className="text-xs font-semibold text-slate-500 tracking-widest">PRESET:</span>
-              <div className="flex items-center gap-1 text-xs font-bold text-[#00E5FF] tracking-widest group-hover:text-white transition-colors">
-                {currentPreset}
-                <svg className={`w-3 h-3 transition-transform duration-200 ${isPresetBrowserOpen ? 'rotate-180' : ''}`} fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" /></svg>
-              </div>
-            </div>
 
             <div className="relative flex items-center gap-2">
               <span className="text-xs font-semibold text-slate-500 tracking-widest">SCALE:</span>
@@ -198,11 +243,36 @@ export default function App() {
             </div>
           </div>
 
-          <div 
-            className="text-xs font-bold text-slate-400 tracking-widest cursor-pointer hover:text-white transition-colors border border-slate-700 px-3 py-1 rounded-md"
-            onClick={() => setRoutingMode((routingMode + 1) % 3)}
-          >
-            {ROUTING_MODES[routingMode]}
+          <div className="flex items-center gap-4">
+            {/* Routing Controls */}
+            <div className="flex items-center gap-3 bg-[#11161d] border border-slate-800 rounded-md px-3 py-1.5">
+              <span className="text-[10px] font-bold text-slate-500 tracking-widest">TYPE:</span>
+              <select 
+                value={channelType} 
+                onChange={e => setChannelType(parseInt(e.target.value))}
+                className="bg-transparent text-xs font-bold text-[#00E5FF] outline-none cursor-pointer tracking-widest appearance-none"
+              >
+                {CHANNEL_TYPES.map((t, i) => <option key={i} value={i} className="bg-[#0a0d12] text-white">{t}</option>)}
+              </select>
+              
+              <div className="w-[1px] h-4 bg-slate-800 mx-1"></div>
+              
+              <span className="text-[10px] font-bold text-slate-500 tracking-widest">CH:</span>
+              <input 
+                type="number" 
+                min={0} max={64} 
+                value={Math.round(channelIdx * 64)} 
+                onChange={e => setChannelIdx(parseInt(e.target.value) / 64.0)}
+                className="w-8 bg-transparent text-xs font-bold text-[#FF0055] outline-none text-center"
+              />
+            </div>
+
+            <div 
+              className="text-xs font-bold text-slate-400 tracking-widest cursor-pointer hover:text-white transition-colors border border-slate-700 px-3 py-1.5 rounded-md"
+              onClick={() => setRoutingMode((routingMode + 1) % 3)}
+            >
+              {ROUTING_MODES[routingMode]}
+            </div>
           </div>
         </div>
 
@@ -241,40 +311,11 @@ export default function App() {
         </div>
 
         {/* Slots Section */}
-        <div className="flex justify-between items-end h-20 px-4 gap-4">
+        <div className="flex justify-center items-end h-20 px-4 gap-4">
           {[1,2,3,4,5,6,7,8].map(i => <Slot key={i} index={i} />)}
         </div>
 
-        {/* Preset Browser Overlay */}
-        {isPresetBrowserOpen && (
-          <div className="absolute inset-0 bg-[#05080c]/90 backdrop-blur-md z-50 flex flex-col p-8 animate-in fade-in duration-200">
-            <div className="flex justify-between items-center mb-8 border-b border-slate-800 pb-4">
-              <h2 className="text-xl font-bold tracking-[0.2em] text-[#00E5FF]">PRESET BROWSER</h2>
-              <button onClick={() => setIsPresetBrowserOpen(false)} className="text-slate-400 hover:text-white">✕</button>
-            </div>
-            <div className="flex gap-12 flex-1 overflow-hidden">
-              {DUMMY_PRESETS.map((cat, i) => (
-                <div key={i} className="flex-1 flex flex-col gap-4">
-                  <h3 className="text-xs font-bold tracking-widest text-slate-500 uppercase">{cat.category}</h3>
-                  <div className="flex flex-col gap-2">
-                    {cat.names.map((name, j) => (
-                      <button 
-                        key={j}
-                        onClick={() => { setCurrentPreset(name.toUpperCase()); setIsPresetBrowserOpen(false); }}
-                        className={`text-left px-4 py-3 rounded-lg text-sm tracking-wider font-semibold transition-all
-                          ${currentPreset === name.toUpperCase() 
-                            ? 'bg-[#00E5FF]/10 text-[#00E5FF] border border-[#00E5FF]/30' 
-                            : 'text-slate-300 hover:bg-slate-800/50 hover:text-white border border-transparent'}`}
-                      >
-                        {name}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
+        {/* Preset Browser Overlay Removed */}
 
       </div>
     </div>
